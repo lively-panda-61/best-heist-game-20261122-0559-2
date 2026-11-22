@@ -1,208 +1,163 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed
-// 1/60 s steps (several in a slow frame, none in a fast one), and the renderer
-// paints what is there. The game moves between five screens: title, play,
-// paused, win and caught, across three heist levels.
-//
-// ?seed=N fixes the patrol jitter. ?shot=start|play|alarm|win|end (with
-// &seed=N) stages that scene instead of running the loop, paints it twice and
-// sets window.__shotReady for a screenshot.
-import { BEST_KEY, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { LEVELS } from './levels.js';
-import { createWorld, EVENT_CAUGHT, EVENT_LOOT, EVENT_WIN } from './world.js';
-import { ACTION_CONFIRM, ACTION_EMP, ACTION_PAUSE, ACTION_SMOKE, createInput } from './input.js';
-import { createRenderer, SCREEN_CAUGHT, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
-import { stageShot } from './shots.js';
+// Entry point for The Velvet Vault: canvas setup, keyboard input,
+// the game loop, deterministic screenshot shots, and a debug hook
+// (window.HEIST) the playtest drives the win path with.
+import { Game } from './game.js';
+import { drawGame } from './render.js';
+import { ensureAudio, sfx } from './audio.js';
+import { LEVELS, TILE, tileWalkable } from './levels.js';
+import { findPath } from './geometry.js';
 
-/** The longest frame the loop catches up on; a longer stall is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const game = new Game();
+const input = { up: false, down: false, left: false, right: false };
+
+const KEYMAP = {
+  KeyW: 'up', ArrowUp: 'up',
+  KeyS: 'down', ArrowDown: 'down',
+  KeyA: 'left', ArrowLeft: 'left',
+  KeyD: 'right', ArrowRight: 'right',
+};
+
+let lastEventSeen = '';
+
+function playEventSound() {
+  if (game.lastEvent === lastEventSeen) return;
+  lastEventSeen = game.lastEvent;
+  if (game.lastEvent === 'loot') sfx.loot();
+  else if (game.lastEvent === 'diamond') sfx.diamond();
+  else if (game.lastEvent === 'smoke') sfx.smoke();
+  else if (game.lastEvent === 'emp') sfx.emp();
+  else if (game.lastEvent === 'caught' || game.lastEvent === 'caught-out') sfx.caught();
+  else if (game.lastEvent === 'exit') sfx.exit();
+  if (game.state === 'win') sfx.win();
+}
+
+function spottedNow() {
+  return game.guards.some((g) => g.state === 'alert');
+}
+let wasSpotted = false;
+
+window.addEventListener('keydown', (e) => {
+  ensureAudio();
+  if (KEYMAP[e.code] !== undefined) {
+    input[KEYMAP[e.code]] = true;
+    e.preventDefault();
+  }
+  if (e.code === 'Space') {
+    if (game.state === 'playing') game.useGadget('smoke');
+    e.preventDefault();
+  }
+  if (e.code === 'KeyE' && game.state === 'playing') game.useGadget('emp');
+  if (e.code === 'Enter') {
+    if (game.state === 'title') game.newGame();
+    else if (game.state === 'levelComplete') game.nextLevel();
+  }
+  if (e.code === 'KeyR' && (game.state === 'gameOver' || game.state === 'win')) game.newGame();
+});
+
+window.addEventListener('keyup', (e) => {
+  if (KEYMAP[e.code] !== undefined) input[KEYMAP[e.code]] = false;
+});
+
+canvas.addEventListener('click', () => {
+  ensureAudio();
+  if (game.state === 'title') game.newGame();
+  else if (game.state === 'levelComplete') game.nextLevel();
+  else if (game.state === 'gameOver' || game.state === 'win') game.newGame();
+});
+
+// Deterministic screenshot setups: fixed states, no randomness, so the
+// cover frame always shows the room, cones, cameras, loot and alarm.
+function setupShot(shot) {
+  if (shot === 'title') {
+    game.startLevel(0);
+    game.state = 'title';
+    for (let i = 0; i < 30; i++) game.tickAmbient(0.5);
+    return;
+  }
+  if (shot === 'cover') {
+    game.startLevel(0);
+    game.state = 'playing';
+    game.time = 3.7;
+    // Two loot already pocketed; the thief mid-room, cones sweeping.
+    game.loot[0].taken = true;
+    game.loot[4].taken = true;
+    game.lootCollected = 2;
+    game.score = 350;
+    game.player.x = 640;
+    game.player.y = 430;
+    game.player.facing = -Math.PI / 2;
+    game.guards[0].x = 700; game.guards[0].y = 340; game.guards[0].dir = Math.PI;
+    game.guards[0].suspicion = 55; game.guards[0].state = 'suspicious';
+    game.guards[1].x = 1000; game.guards[1].y = 300; game.guards[1].dir = Math.PI * 0.75;
+    game.alarm = 25;
+    return;
+  }
+  if (shot === 'alarm') {
+    game.startLevel(0);
+    game.state = 'playing';
+    game.time = 6.2;
+    game.player.x = 700;
+    game.player.y = 300;
+    game.player.facing = Math.PI;
+    game.guards[0].x = 660; game.guards[0].y = 300; game.guards[0].dir = 0;
+    game.guards[0].suspicion = 100; game.guards[0].state = 'alert';
+    game.guards[0].lastSeen = { x: 700, y: 300 };
+    game.alarm = 78;
+    game.ghost = false;
+    return;
+  }
+  if (shot === 'escape') {
+    game.startLevel(2);
+    game.state = 'playing';
+    game.time = 9.4;
+    for (const item of game.loot) item.taken = true;
+    game.lootCollected = game.totalLoot;
+    game.exitOpen = true;
+    game.score = 1450;
+    game.player.x = 1080;
+    game.player.y = 140;
+    game.player.facing = Math.PI / 4;
+    game.guards[0].x = 500; game.guards[0].y = 420; game.guards[0].dir = -Math.PI / 2;
+    game.guards[1].x = 900; game.guards[1].y = 420; game.guards[1].dir = Math.PI;
+    game.lastEvent = 'diamond';
+    return;
+  }
+}
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const renderer = createRenderer(canvas);
-
-let levelIndex = 0;
-let totalScore = 0;
-let world = createWorld(levelIndex, createRandom(seed));
-
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best haul then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
+if (shot) {
+  setupShot(shot);
+  drawGame(ctx, game);
+} else {
   let last = performance.now();
-  let toast = '';
-  let toastUntil = 0;
-
-  // Screen readers (and anyone watching the page's text) hear screen changes.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function showToast(message) {
-    toast = message;
-    toastUntil = performance.now() + 3500;
-  }
-
-  function startLevel(index) {
-    levelIndex = index;
-    world = createWorld(levelIndex, createRandom(seed + index));
-    screen = SCREEN_PLAY;
-    const level = LEVELS[index];
-    showToast(`${level.name} — ${level.subtitle}`);
-    announce(`Level ${index + 1}: ${level.name}. ${level.subtitle}`);
-  }
-
-  function startGame() {
-    totalScore = 0;
-    startLevel(0);
-  }
-
-  function endRun(won) {
-    totalScore += world.state.score;
-    if (won && levelIndex < LEVELS.length - 1) {
-      announce(`Level clear. Haul ${world.state.score}. Next heist.`);
-      startLevel(levelIndex + 1);
-      return;
-    }
-    screen = won ? SCREEN_WIN : SCREEN_CAUGHT;
-    if (won) {
-      const finalScore = totalScore;
-      if (finalScore > best) {
-        best = finalScore;
-        saveBest(best);
-      }
-      announce(`Clean getaway. Total haul ${finalScore}. Best ${best}.`);
-    } else {
-      announce(`Busted. Haul ${world.state.score}. Best ${best}.`);
-    }
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM) {
-      if (screen === SCREEN_TITLE) startGame();
-      else if (screen === SCREEN_WIN || screen === SCREEN_CAUGHT) startGame();
-      else if (screen === SCREEN_PAUSED) {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      }
-    }
-    if (actions & ACTION_PAUSE) {
-      if (screen === SCREEN_PLAY) {
-        screen = SCREEN_PAUSED;
-        announce('Paused.');
-      } else if (screen === SCREEN_PAUSED) {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      }
-    }
-    if (screen === SCREEN_PLAY) {
-      if (actions & ACTION_SMOKE) world.step(STEP, { x: 0, y: 0, smoke: true });
-      if (actions & ACTION_EMP) world.step(STEP, { x: 0, y: 0, emp: true });
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, { x: 0, y: 0 });
-      return;
-    }
-    if (screen !== SCREEN_PLAY) return;
-    const direction = input.direction();
-    const events = world.step(STEP, {
-      x: direction.x,
-      y: direction.y,
-      run: input.running(),
-      sneak: input.sneaking(),
-    });
-    if (events & EVENT_LOOT) {
-      const taken = world.state.loot.filter((item) => item.taken).length;
-      announce(`Loot taken. ${taken} of ${world.state.loot.length}. Score ${world.state.score}.`);
-    }
-    if (events & EVENT_WIN) endRun(true);
-    else if (events & EVENT_CAUGHT) endRun(false);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
+    if (game.state === 'playing') {
+      game.update(dt, input);
+      if (spottedNow() && !wasSpotted) sfx.spotted();
+      wasSpotted = spottedNow();
+      playEventSound();
     } else {
-      accumulator = 0;
+      game.tickAmbient(dt);
     }
-    if (toast && performance.now() > toastUntil) toast = '';
-    renderer.draw(world.state, screen, best, screen === SCREEN_PLAY ? toast : '');
+    drawGame(ctx, game);
+    requestAnimationFrame(loop);
   }
-
-  // Leaving the tab pauses a running game rather than letting guards close in unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  // Playtests drive the real game through this handle: state is read-only
-  // observation, debugPlace is the same hook the screenshot stager uses.
-  window.__game = {
-    get world() {
-      return world;
-    },
-    get screen() {
-      return screen;
-    },
-    get levelIndex() {
-      return levelIndex;
-    },
-    get totalScore() {
-      return totalScore;
-    },
-    startGame,
-  };
-
-  announce('The Midnight Vault. Press Space or click to start.');
-  requestAnimationFrame(frame);
+  requestAnimationFrame(loop);
 }
 
-if (shot) runShot(shot);
-else runGame();
+// Debug / playtest hook: exposes the live game, the pathfinder and the
+// level data so an automated driver can prove the win path end to end.
+window.HEIST = {
+  game,
+  input,
+  LEVELS,
+  TILE,
+  tileWalkable,
+  findPath,
+  newGame: () => game.newGame(),
+};
